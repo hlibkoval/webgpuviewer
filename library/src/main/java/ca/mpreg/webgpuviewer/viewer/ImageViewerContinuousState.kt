@@ -84,7 +84,7 @@ class ImageViewerContinuousState : ImageViewerState(isVertical = true) {
     /** Highest [scale] a gesture may settle at. Unset, twice [doubleTapScale] and at least 4. */
     var maxScale = 0f
         get() {
-            if (field > 0) return field
+            if (field > 0) return max(field, homeScale)
             return max(doubleTapScale * 2f, 4f)
         }
 
