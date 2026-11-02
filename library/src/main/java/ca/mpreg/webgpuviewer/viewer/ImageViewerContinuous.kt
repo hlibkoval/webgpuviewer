@@ -69,7 +69,7 @@ fun ImageViewerContinuous(
 
     HdrColorModeHost()
 
-    val surfaceModifier = modifier
+    val surfaceModifier = Modifier
         .fillMaxSize()
         .pointerInput(Unit) {
             val doubleTapTimeout = viewConfiguration.doubleTapTimeoutMillis
@@ -498,7 +498,7 @@ fun ImageViewerContinuous(
             }
         }
 
-    Box {
+    Box(modifier) {
         ViewerSurface(surfaceModifier) { surface, width, height ->
             try {
                 // Before init: the panel's HDR support gates the decode path, which can reach

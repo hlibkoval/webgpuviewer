@@ -99,7 +99,7 @@ fun ImageViewer(
 
     // SurfaceView or TextureView depending on whether HDR is reachable - see [ViewerSurface],
     // which also carries the mihonapp/mihon#3773 history behind that choice.
-    val surfaceModifier = modifier
+    val surfaceModifier = Modifier
         .fillMaxSize()
         .pointerInput(Unit) {
             val doubleTapTimeout = viewConfiguration.doubleTapTimeoutMillis
@@ -576,7 +576,7 @@ fun ImageViewer(
             }
         }
 
-    Box {
+    Box(modifier) {
         ViewerSurface(surfaceModifier) { surface, width, height ->
             try {
                 // Before init: whether the panel does HDR at all gates the decode path, which can
