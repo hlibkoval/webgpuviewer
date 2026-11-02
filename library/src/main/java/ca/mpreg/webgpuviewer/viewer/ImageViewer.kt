@@ -48,7 +48,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
-import kotlin.math.exp
+import kotlin.math.pow
 import kotlin.time.Duration.Companion.milliseconds
 
 @Composable
@@ -238,7 +238,7 @@ fun ImageViewer(
                                         val py = secondDown.position.y / state.height - 0.5f
 
                                         val newScale =
-                                            quickZoomScale(originalScale, totalDeltaY)
+                                            originalScale * 10f.pow(2 * totalDeltaY / state.height)
 
                                         val diff = 1 / newScale - 1 / originalScale
 
@@ -276,7 +276,7 @@ fun ImageViewer(
                                         val py = secondDown.position.y / state.height - 0.5f
 
                                         val newScale =
-                                            quickZoomScale(originalScale, totalDeltaY + value)
+                                            originalScale * 10f.pow(2 * (totalDeltaY + value) / state.height)
 
                                         val scale =
                                             newScale.fastCoerceIn(page.homeScale, page.maxScale)
@@ -597,11 +597,6 @@ fun ImageViewer(
         ComposePageHostView(state, Modifier.matchParentSize())
     }
 }
-
-/**
- * [scale] after a double tap drag of [dy] px: Telephoto's rate, compounding 0.4% a pixel, so the readers zoom alike.
- */
-private fun quickZoomScale(scale: Float, dy: Float) = scale * exp(0.004f * dy)
 
 /**
  * Holds the window's HDR colour mode while this viewer is composed, and restores it on window refocus.
