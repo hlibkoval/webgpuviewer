@@ -324,6 +324,7 @@ fun ImageViewer(
                     var scaleOrigin = Offset(0.5f, 0.5f)
 
                     var single = true
+                    var trackingMidpoint = false
                     var pageTurning = wasScrolling
 
                     // If grabbing mid-animation, update firstPos so panning continues smoothly
@@ -370,15 +371,23 @@ fun ImageViewer(
                                         // The fingers' midpoint: one finger's own speed would fling a
                                         // still pinch on release.
                                         velocityTracker.addPosition(change.uptimeMillis, centroid)
+                                        trackingMidpoint = true
                                         single = false
                                         scaleOrigin = Offset(
                                             centroid.x / state.width, centroid.y / state.height
                                         )
                                     }
-                                } else if (single && change.pressed) {
+                                } else {
                                     // Not the lift: it repeats the last position, so a lift a moment after the last
                                     // move reads as the finger having stopped, as Android's tracker knows to skip.
-                                    velocityTracker.addPointerInputChange(change)
+                                    event.changes.firstOrNull { it.pressed }?.let { finger ->
+                                        // The finger a pinch leaves pans on at its own speed, not the midpoint's.
+                                        if (trackingMidpoint) {
+                                            velocityTracker.resetTracking()
+                                            trackingMidpoint = false
+                                        }
+                                        velocityTracker.addPointerInputChange(finger)
+                                    }
                                 }
 
                                 if (pointerCountChanged) continue

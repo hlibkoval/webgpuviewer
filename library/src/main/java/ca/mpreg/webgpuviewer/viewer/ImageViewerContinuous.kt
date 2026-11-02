@@ -348,6 +348,7 @@ fun ImageViewerContinuous(
                     velocityTracker.addPointerInputChange(firstDown)
 
                     var single = true
+                    var trackingMidpoint = false
                     var zoomOriginX = 0f
                     var zoomOriginY = 0f
                     var lastMoveTime = firstDown.uptimeMillis
@@ -373,9 +374,17 @@ fun ImageViewerContinuous(
                                     // The fingers' midpoint: one finger's own speed would fling a
                                     // still pinch on release.
                                     velocityTracker.addPosition(change.uptimeMillis, event.calculateCentroid(useCurrent = true))
-                                } else if (single && change.pressed) {
+                                    trackingMidpoint = true
+                                } else {
                                     // Not the lift: it repeats the last position - see ImageViewer.
-                                    velocityTracker.addPointerInputChange(change)
+                                    event.changes.firstOrNull { it.pressed }?.let { finger ->
+                                        // The finger a pinch leaves pans on at its own speed, not the midpoint's.
+                                        if (trackingMidpoint) {
+                                            velocityTracker.resetTracking()
+                                            trackingMidpoint = false
+                                        }
+                                        velocityTracker.addPointerInputChange(finger)
+                                    }
                                 }
 
                                 val pan = event.calculatePan()
