@@ -120,11 +120,27 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
     val width get() = renderer.width
     val height get() = renderer.height
 
-    /** Top padding clearing the display cutout, in pixels. Set by ImageViewer while [avoidCutout]. */
-    var cutoutTopPx: Float = 0f
+    /** The display cutout's height at the top, in pixels. Set by ImageViewer, main thread. */
+    var displayCutoutTopPx: Float = 0f
+        set(value) {
+            if (field == value) return
+            // Before the change: it can arrive after pages are placed, and those at home follow it.
+            val atHome = onScreenPages.filter { it.atHome }
+            field = value
+            for (page in atHome) {
+                page.x = page.homeX
+                page.y = page.homeY
+                page.scale = page.homeScale
+            }
+            invalidate()
+        }
+
+    /** Top padding clearing the display cutout, in pixels. */
+    val cutoutTopPx: Float
+        get() = if (avoidCutout) displayCutoutTopPx else 0f
 
     val viewportHeight: Float
-        get() = height - if (avoidCutout) cutoutTopPx else 0f
+        get() = height - cutoutTopPx
 
     var dpi = Resources.getSystem().displayMetrics.densityDpi / 100f
     var density: Density =

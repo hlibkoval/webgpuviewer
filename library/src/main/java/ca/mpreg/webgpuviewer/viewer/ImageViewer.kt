@@ -1,5 +1,6 @@
 package ca.mpreg.webgpuviewer.viewer
 
+import android.os.Build
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.VectorConverter
@@ -11,14 +12,10 @@ import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
@@ -33,8 +30,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.compose.ui.util.fastForEach
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.window.layout.FoldingFeature
 import androidx.window.layout.WindowInfoTracker
 import ca.mpreg.webgpuviewer.NormalMotionDurationScale
@@ -47,7 +47,6 @@ import ca.mpreg.webgpuviewer.waitForDown
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import androidx.compose.ui.unit.Velocity
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.time.Duration.Companion.milliseconds
@@ -64,6 +63,10 @@ fun ImageViewer(
     val view = LocalView.current
     val density = LocalDensity.current
 
+    LaunchedEffect(density) {
+        state.density = density
+    }
+
     // The platform's bar for "this gesture was a fling", the same one a scrolling list uses. A
     // fixed figure here was several times it, so a gentle pan across a zoomed page stopped dead
     // the moment the finger lifted.
@@ -72,26 +75,22 @@ fun ImageViewer(
     }
     val context = LocalContext.current
 
-    val unfolded by produceState(false, context) {
-        val activity = context.findActivity() ?: return@produceState
+    LaunchedEffect(context) {
+        val activity = context.findActivity() ?: return@LaunchedEffect
         WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity).collect { info ->
-            value = info.displayFeatures.any { it is FoldingFeature }
+            var px = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                view.display?.cutout?.safeInsetTop
+            } else {
+                ViewCompat.getRootWindowInsets(view)
+                    ?.getInsets(WindowInsetsCompat.Type.displayCutout())?.top
+            }?.toFloat() ?: 0f
+            // Inner screen reports 0 (z fold 8), use status bar
+            if (px == 0f && info.displayFeatures.any { it is FoldingFeature }) {
+                val id = context.resources.getIdentifier("status_bar_height", "dimen", "android")
+                if (id != 0) px = context.resources.getDimensionPixelSize(id).toFloat()
+            }
+            state.displayCutoutTopPx = px
         }
-    }
-    val statusBarPx = remember(context) {
-        val id = context.resources.getIdentifier("status_bar_height", "dimen", "android")
-        if (id != 0) context.resources.getDimensionPixelSize(id).toFloat() else 0f
-    }
-    val cutoutPx = WindowInsets.displayCutout.getTop(density).let { px ->
-        if (px == 0 && unfolded) statusBarPx else px.toFloat()
-    }
-
-    LaunchedEffect(density) {
-        state.density = density
-    }
-
-    LaunchedEffect(state.avoidCutout, cutoutPx) {
-        state.cutoutTopPx = if (state.avoidCutout) cutoutPx else 0f
     }
 
     RequestMaxRefreshRate()

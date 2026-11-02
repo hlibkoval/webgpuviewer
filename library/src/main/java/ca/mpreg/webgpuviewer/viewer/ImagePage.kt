@@ -1,7 +1,5 @@
 package ca.mpreg.webgpuviewer.viewer
 
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.Mutex
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
@@ -50,6 +48,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.yield
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicInteger
@@ -1952,7 +1952,7 @@ open class ImagePage {
         val slack = floor > natMax
         val center = (floor + natMax) / 2f
 
-        if (!parent.avoidCutout || parent.cutoutTopPx <= 0f || parent.height <= 0) {
+        if (parent.height <= 0 || scale <= 0f) {
             return if (slack) center to center else floor to natMax
         }
 
