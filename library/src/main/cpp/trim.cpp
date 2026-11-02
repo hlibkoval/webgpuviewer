@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <jni.h>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -358,10 +359,15 @@ Java_ca_mpreg_webgpuviewer_TrimNative_findTrim(JNIEnv *env, jobject thiz,
       if (y0 >= y1) {
         continue;
       }
-      workers.emplace_back([=, &tests, &bandResults] {
+      try {
+        workers.emplace_back([=, &tests, &bandResults] {
+          scanBand(pixels, width, y0, y1, tests.data(), colorCount,
+                   bandResults[t].data());
+        });
+      } catch (const std::system_error &) {
         scanBand(pixels, width, y0, y1, tests.data(), colorCount,
                  bandResults[t].data());
-      });
+      }
     }
 
     scanBand(pixels, width, 0, std::min(rowsPerBand, height), tests.data(),

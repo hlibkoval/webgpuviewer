@@ -2,6 +2,7 @@
 #include <cmath>
 #include <jni.h>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -49,7 +50,8 @@ inline uint8_t linearToSRGBExact(float linearVal) {
 }
 
 inline uint8_t linearToSRGBFast(float linearVal) {
-  if (linearVal <= 0.0f)
+  // Negated so NaN lands here too, not on an index past the table.
+  if (!(linearVal > 0.0f))
     return 0;
   if (linearVal >= 1.0f)
     return 255;
@@ -72,7 +74,8 @@ static void areaRows(const uint32_t *src, uint32_t *dst, int srcWidth,
 
 /* Splits [0, rows) into bands, one per core up to 4, run concurrently. */
 template <typename F> static void parallelRows(int rows, F work) {
-  int threads = (int)std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
+  int threads =
+      (int)std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
   threads = std::min(threads, std::max(1, rows / 64));
   if (threads == 1) {
     work(0, rows);
@@ -84,7 +87,12 @@ template <typename F> static void parallelRows(int rows, F work) {
     int start = t * band;
     if (start >= rows)
       break;
-    pool.emplace_back(work, start, std::min(rows, start + band));
+    int end = std::min(rows, start + band);
+    try {
+      pool.emplace_back(work, start, end);
+    } catch (const std::system_error &) {
+      work(start, end);
+    }
   }
   work(0, std::min(rows, band));
   for (auto &th : pool)
@@ -130,7 +138,8 @@ static void resizeArea(JNIEnv *env, jobject src_buffer, jobject dst_buffer,
     return;
 
   parallelRows(dstHeight, [=](int yStart, int yEnd) {
-    if (dstWidth == srcWidth / 2 && dstHeight == srcHeight / 2) {
+    // Exact halves only
+    if (srcWidth == dstWidth * 2 && srcHeight == dstHeight * 2) {
       halveRows(src, dst, srcWidth, dstWidth, yStart, yEnd);
     } else {
       areaRows(src, dst, srcWidth, srcHeight, dstWidth, dstHeight, yStart,
