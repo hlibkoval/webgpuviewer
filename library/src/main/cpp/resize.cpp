@@ -2,27 +2,24 @@
 #include <cmath>
 #include <jni.h>
 #include <mutex>
+#include <new>
 #include <system_error>
 #include <thread>
 #include <vector>
 
-#ifdef __ARM_NEON
-#include <arm_neon.h>
-#endif
-
-float srgbToLinearLUT[256];
-std::once_flag lutsOnceFlag;
+static float srgbToLinearLUT[256];
+static std::once_flag lutsOnceFlag;
 
 /* linearToSRGBExact sampled finely enough that it differs only at rounding
  * edges - pow per channel was most of a halving's time. */
 constexpr int LINEAR_STEPS = 1 << 16;
-uint8_t linearToSrgbLUT[LINEAR_STEPS + 1];
+static uint8_t linearToSrgbLUT[LINEAR_STEPS + 1];
 
-inline uint8_t linearToSRGBExact(float linearVal);
+static inline uint8_t linearToSRGBExact(float linearVal);
 
 /* A bare bool flag races: two mipmap levels can resize concurrently on first
  * use. */
-void initLUTs() {
+static void initLUTs() {
   std::call_once(lutsOnceFlag, [] {
     for (int i = 0; i < 256; i++) {
       float val01 = i / 255.0f;
@@ -36,7 +33,7 @@ void initLUTs() {
   });
 }
 
-inline uint8_t linearToSRGBExact(float linearVal) {
+static inline uint8_t linearToSRGBExact(float linearVal) {
   if (linearVal <= 0.0f)
     return 0;
   if (linearVal >= 1.0f)
@@ -49,7 +46,7 @@ inline uint8_t linearToSRGBExact(float linearVal) {
   return static_cast<uint8_t>(std::roundf(srgb01 * 255.0f));
 }
 
-inline uint8_t linearToSRGBFast(float linearVal) {
+static inline uint8_t linearToSRGBFast(float linearVal) {
   // Negated so NaN lands here too, not on an index past the table.
   if (!(linearVal > 0.0f))
     return 0;
@@ -58,7 +55,7 @@ inline uint8_t linearToSRGBFast(float linearVal) {
   return linearToSrgbLUT[(int)(linearVal * LINEAR_STEPS + 0.5f)];
 }
 
-inline uint8_t exactLinearToAlpha(float linearAlpha) {
+static inline uint8_t exactLinearToAlpha(float linearAlpha) {
   if (linearAlpha <= 0.0f)
     return 0;
   if (linearAlpha >= 1.0f)
@@ -68,8 +65,16 @@ inline uint8_t exactLinearToAlpha(float linearAlpha) {
 
 static void halveRows(const uint32_t *src, uint32_t *dst, int srcWidth,
                       int dstWidth, int yStart, int yEnd);
+
+struct Spans {
+  std::vector<int> start, count, offset;
+  std::vector<float> weight;
+};
+
+static Spans makeSpans(int srcSize, int dstSize);
+template <typename Sum>
 static void areaRows(const uint32_t *src, uint32_t *dst, int srcWidth,
-                     int srcHeight, int dstWidth, int dstHeight, int yStart,
+                     int dstWidth, const Spans &xs, const Spans &ys, int yStart,
                      int yEnd);
 
 /* Splits [0, rows) into bands, one per core up to 4, run concurrently. */
@@ -99,14 +104,40 @@ template <typename F> static void parallelRows(int rows, F work) {
     th.join();
 }
 
-/* Box filter in linear light to any size; a larger one repeats pixels. A
- * mismatched size/buffer indexes past its end rather than throwing, so both are
- * checked. */
+/* Linear-light box filter. Unchecked: sizes > 0 and buffers that fit them. */
+static void resizePixels(const uint32_t *src, uint32_t *dst, int srcWidth,
+                         int srcHeight, int dstWidth, int dstHeight) {
+  initLUTs();
+
+  if (srcWidth == dstWidth * 2 && srcHeight == dstHeight * 2) {
+    parallelRows(dstHeight, [=](int yStart, int yEnd) {
+      halveRows(src, dst, srcWidth, dstWidth, yStart, yEnd);
+    });
+    return;
+  }
+
+  Spans xs, ys;
+  try {
+    xs = makeSpans(srcWidth, dstWidth);
+    ys = makeSpans(srcHeight, dstHeight);
+  } catch (const std::bad_alloc &) {
+    return;
+  }
+  // Float sums drift tens of levels over millions of pixels
+  const bool hugeBoxes =
+      (double)srcWidth * srcHeight > (double)dstWidth * dstHeight * 65536.0;
+  // By reference, or each thread copies the tables.
+  parallelRows(dstHeight, [&](int yStart, int yEnd) {
+    if (hugeBoxes)
+      areaRows<double>(src, dst, srcWidth, dstWidth, xs, ys, yStart, yEnd);
+    else
+      areaRows<float>(src, dst, srcWidth, dstWidth, xs, ys, yStart, yEnd);
+  });
+}
+
 static void resizeArea(JNIEnv *env, jobject src_buffer, jobject dst_buffer,
                        jint srcWidth, jint srcHeight, jint dstWidth,
                        jint dstHeight) {
-  initLUTs();
-
   if (!env || !src_buffer || !dst_buffer)
     return;
   if (srcWidth <= 0 || srcHeight <= 0)
@@ -137,15 +168,7 @@ static void resizeArea(JNIEnv *env, jobject src_buffer, jobject dst_buffer,
   if (dstCapacity < 0 || dstCapacity < dstNeeded)
     return;
 
-  parallelRows(dstHeight, [=](int yStart, int yEnd) {
-    // Exact halves only
-    if (srcWidth == dstWidth * 2 && srcHeight == dstHeight * 2) {
-      halveRows(src, dst, srcWidth, dstWidth, yStart, yEnd);
-    } else {
-      areaRows(src, dst, srcWidth, srcHeight, dstWidth, dstHeight, yStart,
-               yEnd);
-    }
-  });
+  resizePixels(src, dst, srcWidth, srcHeight, dstWidth, dstHeight);
 }
 
 /* Each 2x2 block in linear light, the common mipmap case without the general
@@ -181,211 +204,68 @@ static void halveRows(const uint32_t *src, uint32_t *dst, int srcWidth,
   }
 }
 
+static Spans makeSpans(int srcSize, int dstSize) {
+  Spans s;
+  s.start.resize(dstSize);
+  s.count.resize(dstSize);
+  s.offset.resize(dstSize);
+  s.weight.reserve((size_t)dstSize *
+                   ((size_t)std::ceil((double)srcSize / dstSize) + 1));
+  // Not float: box edges drift at large sizes and flip pixels.
+  double scale = (double)srcSize / dstSize;
+  for (int d = 0; d < dstSize; ++d) {
+    double lo = d * scale;
+    double hi = lo + scale;
+    int first = std::min(srcSize - 1, std::max(0, (int)lo));
+    // Not (int)hi, which adds a zero-weight pixel at whole-number ends.
+    int last = std::min(srcSize - 1, (int)std::ceil(hi) - 1);
+    s.start[d] = first;
+    s.count[d] = std::max(0, last - first + 1);
+    s.offset[d] = (int)s.weight.size();
+    for (int i = first; i <= last; ++i) {
+      double w = std::min((double)i + 1.0, hi) - std::max((double)i, lo);
+      s.weight.push_back(w > 0 ? (float)w : 0.0f);
+    }
+  }
+  return s;
+}
+
+template <typename Sum>
 static void areaRows(const uint32_t *src, uint32_t *dst, int srcWidth,
-                     int srcHeight, int dstWidth, int dstHeight, int yStart,
+                     int dstWidth, const Spans &xs, const Spans &ys, int yStart,
                      int yEnd) {
-  double scaleX = (double)srcWidth / dstWidth;
-  double scaleY = (double)srcHeight / dstHeight;
-
   for (int y = yStart; y < yEnd; ++y) {
-    double srcYStart = y * scaleY;
-    double srcYEnd = srcYStart + scaleY;
-    int yMin = std::max(0, (int)srcYStart);
-    int yMax = std::min(srcHeight - 1, (int)srcYEnd);
-
+    const float *yWeights = &ys.weight[ys.offset[y]];
+    int y0 = ys.start[y], yCount = ys.count[y];
     for (int x = 0; x < dstWidth; ++x) {
-      double srcXStart = x * scaleX;
-      double srcXEnd = srcXStart + scaleX;
-      int xMin = std::max(0, (int)srcXStart);
-      int xMax = std::min(srcWidth - 1, (int)srcXEnd);
-
+      const float *xWeights = &xs.weight[xs.offset[x]];
+      int x0 = xs.start[x], xCount = xs.count[x];
+      Sum sumA = 0, sumR = 0, sumG = 0, sumB = 0;
+      Sum totalWeight = 0;
+      for (int j = 0; j < yCount; ++j) {
+        const uint32_t *row = src + (size_t)(y0 + j) * srcWidth + x0;
+        for (int i = 0; i < xCount; ++i) {
+          float w = xWeights[i] * yWeights[j];
+          uint32_t pixel = row[i];
+          float aw = ((pixel >> 24) & 0xFF) / 255.0f * w;
+          totalWeight += w;
+          sumA += aw;
+          sumR += srgbToLinearLUT[(pixel >> 16) & 0xFF] * aw;
+          sumG += srgbToLinearLUT[(pixel >> 8) & 0xFF] * aw;
+          sumB += srgbToLinearLUT[pixel & 0xFF] * aw;
+        }
+      }
       uint32_t finalA = 0, finalR = 0, finalG = 0, finalB = 0;
-
-#ifdef __ARM_NEON
-      float32x4_t v_sum_a = vdupq_n_f32(0.0f);
-      float32x4_t v_sum_r = vdupq_n_f32(0.0f);
-      float32x4_t v_sum_g = vdupq_n_f32(0.0f);
-      float32x4_t v_sum_b = vdupq_n_f32(0.0f);
-      float totalWeight = 0.0f;
-
-      float sumA_scalar = 0.0f;
-      float sumR_scalar = 0.0f;
-      float sumG_scalar = 0.0f;
-      float sumB_scalar = 0.0f;
-
-      for (int sy = yMin; sy <= yMax; ++sy) {
-        double yWeight = std::min((double)sy + 1.0, srcYEnd) -
-                         std::max((double)sy, srcYStart);
-        if (yWeight <= 0)
-          continue;
-
-        int sx = xMin;
-
-        for (; sx <= xMax - 3; sx += 4) {
-          float weights[4];
-          float linearA[4], linearR[4], linearG[4], linearB[4];
-
-          for (int i = 0; i < 4; ++i) {
-            double xWeight = std::min((double)(sx + i) + 1.0, srcXEnd) -
-                             std::max((double)(sx + i), srcXStart);
-            weights[i] = (xWeight > 0) ? (float)(xWeight * yWeight) : 0.0f;
-            totalWeight += weights[i];
-
-            uint32_t pixel = src[(size_t)sy * srcWidth + (sx + i)];
-            float aVal = ((pixel >> 24) & 0xFF) / 255.0f;
-
-            linearA[i] = aVal;
-            linearR[i] = srgbToLinearLUT[(pixel >> 16) & 0xFF] * aVal;
-            linearG[i] = srgbToLinearLUT[(pixel >> 8) & 0xFF] * aVal;
-            linearB[i] = srgbToLinearLUT[pixel & 0xFF] * aVal;
-          }
-
-          float32x4_t v_w = vld1q_f32(weights);
-          float32x4_t v_a = vld1q_f32(linearA);
-          float32x4_t v_r = vld1q_f32(linearR);
-          float32x4_t v_g = vld1q_f32(linearG);
-          float32x4_t v_b = vld1q_f32(linearB);
-
-          v_sum_a = vmlaq_f32(v_sum_a, v_a, v_w);
-          v_sum_r = vmlaq_f32(v_sum_r, v_r, v_w);
-          v_sum_g = vmlaq_f32(v_sum_g, v_g, v_w);
-          v_sum_b = vmlaq_f32(v_sum_b, v_b, v_w);
+      if (totalWeight > 0) {
+        float a = (float)(sumA / totalWeight);
+        if (a > 0.00001f) {
+          Sum invAlpha = 1 / sumA;
+          finalR = linearToSRGBFast(std::min(1.0f, (float)(sumR * invAlpha)));
+          finalG = linearToSRGBFast(std::min(1.0f, (float)(sumG * invAlpha)));
+          finalB = linearToSRGBFast(std::min(1.0f, (float)(sumB * invAlpha)));
         }
-
-        for (; sx <= xMax; ++sx) {
-          double xWeight = std::min((double)sx + 1.0, srcXEnd) -
-                           std::max((double)sx, srcXStart);
-          if (xWeight <= 0)
-            continue;
-
-          float pWeight = (float)(xWeight * yWeight);
-          totalWeight += pWeight;
-
-          uint32_t pixel = src[(size_t)sy * srcWidth + sx];
-          float aVal = ((pixel >> 24) & 0xFF) / 255.0f;
-          float rVal = srgbToLinearLUT[(pixel >> 16) & 0xFF] * aVal;
-          float gVal = srgbToLinearLUT[(pixel >> 8) & 0xFF] * aVal;
-          float bVal = srgbToLinearLUT[pixel & 0xFF] * aVal;
-
-          sumA_scalar += aVal * pWeight;
-          sumR_scalar += rVal * pWeight;
-          sumG_scalar += gVal * pWeight;
-          sumB_scalar += bVal * pWeight;
-        }
+        finalA = exactLinearToAlpha(a);
       }
-
-      if (totalWeight > 0.0f) {
-        float sumA = vgetq_lane_f32(v_sum_a, 0) + vgetq_lane_f32(v_sum_a, 1) +
-                     vgetq_lane_f32(v_sum_a, 2) + vgetq_lane_f32(v_sum_a, 3) +
-                     sumA_scalar;
-        float sumR = vgetq_lane_f32(v_sum_r, 0) + vgetq_lane_f32(v_sum_r, 1) +
-                     vgetq_lane_f32(v_sum_r, 2) + vgetq_lane_f32(v_sum_r, 3) +
-                     sumR_scalar;
-        float sumG = vgetq_lane_f32(v_sum_g, 0) + vgetq_lane_f32(v_sum_g, 1) +
-                     vgetq_lane_f32(v_sum_g, 2) + vgetq_lane_f32(v_sum_g, 3) +
-                     sumG_scalar;
-        float sumB = vgetq_lane_f32(v_sum_b, 0) + vgetq_lane_f32(v_sum_b, 1) +
-                     vgetq_lane_f32(v_sum_b, 2) + vgetq_lane_f32(v_sum_b, 3) +
-                     sumB_scalar;
-
-        float invWeight = 1.0f / totalWeight;
-        float finalLinearA = sumA * invWeight;
-        float finalLinearR = sumR * invWeight;
-        float finalLinearG = sumG * invWeight;
-        float finalLinearB = sumB * invWeight;
-
-        if (finalLinearA > 0.00001f) {
-          float invAlpha = 1.0f / finalLinearA;
-          finalLinearR = std::min(1.0f, finalLinearR * invAlpha);
-          finalLinearG = std::min(1.0f, finalLinearG * invAlpha);
-          finalLinearB = std::min(1.0f, finalLinearB * invAlpha);
-        } else {
-          finalLinearR = 0.0f;
-          finalLinearG = 0.0f;
-          finalLinearB = 0.0f;
-        }
-
-        finalA = exactLinearToAlpha(finalLinearA);
-        finalR = linearToSRGBFast(finalLinearR);
-        finalG = linearToSRGBFast(finalLinearG);
-        finalB = linearToSRGBFast(finalLinearB);
-      }
-#else
-      float sumA = 0.0f, sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
-      float totalWeight = 0.0f;
-
-      int numXPixels = xMax - xMin + 1;
-
-      /* A 256 cap silently truncated (and skewed) a downscale wider than that
-       * per pixel. */
-      std::vector<float> xWeights(numXPixels);
-
-      for (int i = 0; i < numXPixels; ++i) {
-        int sx = xMin + i;
-        double xWeight = std::min((double)sx + 1.0, srcXEnd) -
-                         std::max((double)sx, srcXStart);
-        xWeights[i] = (xWeight > 0) ? (float)xWeight : 0.0f;
-      }
-
-      for (int sy = yMin; sy <= yMax; ++sy) {
-        double yWeight = std::min((double)sy + 1.0, srcYEnd) -
-                         std::max((double)sy, srcYStart);
-        if (yWeight <= 0)
-          continue;
-
-        float yWeightF = (float)yWeight;
-        size_t srcRowOffset = (size_t)sy * srcWidth;
-
-        for (int sx = xMin; sx <= xMax; ++sx) {
-          int cacheIdx = sx - xMin;
-
-          float pWeight = xWeights[cacheIdx] * yWeightF;
-          if (pWeight <= 0.0f)
-            continue;
-
-          uint32_t pixel = src[srcRowOffset + sx];
-
-          uint8_t a = (pixel >> 24) & 0xFF;
-          uint8_t r = (pixel >> 16) & 0xFF;
-          uint8_t g = (pixel >> 8) & 0xFF;
-          uint8_t b = pixel & 0xFF;
-
-          float aVal = a / 255.0f;
-
-          sumA += aVal * pWeight;
-          sumR += srgbToLinearLUT[r] * aVal * pWeight;
-          sumG += srgbToLinearLUT[g] * aVal * pWeight;
-          sumB += srgbToLinearLUT[b] * aVal * pWeight;
-
-          totalWeight += pWeight;
-        }
-      }
-
-      if (totalWeight > 0.0f) {
-        float invWeight = 1.0f / totalWeight;
-        float finalLinearA = sumA * invWeight;
-        float finalLinearR = sumR * invWeight;
-        float finalLinearG = sumG * invWeight;
-        float finalLinearB = sumB * invWeight;
-
-        if (finalLinearA > 0.00001f) {
-          float invAlpha = 1.0f / finalLinearA;
-          finalLinearR = std::min(1.0f, finalLinearR * invAlpha);
-          finalLinearG = std::min(1.0f, finalLinearG * invAlpha);
-          finalLinearB = std::min(1.0f, finalLinearB * invAlpha);
-        } else {
-          finalLinearR = 0.0f;
-          finalLinearG = 0.0f;
-          finalLinearB = 0.0f;
-        }
-
-        finalA = exactLinearToAlpha(finalLinearA);
-        finalR = linearToSRGBFast(finalLinearR);
-        finalG = linearToSRGBFast(finalLinearG);
-        finalB = linearToSRGBFast(finalLinearB);
-      }
-#endif
-
       dst[(size_t)y * dstWidth + x] =
           (finalA << 24) | (finalR << 16) | (finalG << 8) | finalB;
     }
