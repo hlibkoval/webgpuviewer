@@ -92,6 +92,17 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         }
 
     /**
+     * True (the default) sharpens a page tile by tile as the high-quality tiles land. False shows
+     * the fast render until every visible tile is ready, then all of them in one frame - for
+     * e-ink, where every presented frame is a visible refresh. Safe from any thread.
+     */
+    var progressiveTiles: Boolean
+        get() = tiles.progressive
+        set(value) {
+            tiles.progressive = value
+        }
+
+    /**
      * A 3D LUT over image pixels after sampling, except composed pages' ([ImagePage.Compose],
      * [ComposePageImage]); [FilterLut3d] in [filters] takes the whole frame instead. Null for
      * none. Safe from any thread. Assign a new table to change it: one edited in place is not

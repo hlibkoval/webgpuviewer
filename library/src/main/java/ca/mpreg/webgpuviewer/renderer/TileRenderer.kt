@@ -414,6 +414,21 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
 
     /**
+     * True shows tiles as they land. False holds a grid's tiles back until every visible one is
+     * ready, then shows them in one frame - for displays where each presented frame is a visible
+     * refresh, like e-ink. A grid shown whole once ([PageTiles.revealed]) then updates as usual
+     * until it is wiped, and keeps its tile size rather than re-cutting to a new
+     * [preferredTileSize], which would hide it again. Safe from any thread.
+     */
+    @Volatile
+    var progressive: Boolean = true
+        set(value) {
+            if (field == value) return
+            field = value
+            invalidate()
+        }
+
+    /**
      * See [TilesFilterChain]. Tiles only: the live fast path ([RenderPage.renderFast]) a pan or
      * pinch draws through stays cheap. Changing a sampler wipes every grid: cached tiles used the
      * old one.
@@ -1009,6 +1024,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         st.tiles.clear()
         st.instancesDirty = true
         st.sweptRange = null
+        st.revealed = false
     }
 
     /** Packed atlas position - both halves are well inside 16 bits at any sane atlas size. */
@@ -1040,6 +1056,12 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         var clipT = 0f
         var clipR = 0f
         var clipB = 0f
+
+        /**
+         * True once a draw found every visible tile cut and none owed a re-cut; false again when
+         * the grid is wiped. Until then, [progressive] false keeps the tiles off screen.
+         */
+        var revealed = false
 
         /** True once the scale has held for two consecutive frames; gates generation. */
         var stable = false
@@ -1085,6 +1107,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             instanceCount = 0
             bindGroup?.close()
             bindGroup = null
+            revealed = false
         }
     }
 
@@ -1655,8 +1678,11 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
 
         val version = page.contentVersion
+        // Held back, a re-cut shown grid would drop to the fast path until refilled: two more
+        // refreshes for nothing the eye asked for. It keeps its size; the next grid takes the new one.
+        val recut = st.tileSize != preferredTileSize && (progressive || !st.revealed)
         if (st.scale != pageScale || st.centerYOffset != centerYOffset ||
-            st.tileSize != preferredTileSize || st.contentVersion != version
+            recut || st.contentVersion != version
         ) {
             // A changed centerYOffset at fixed scale means a placeholder corrected its guessed
             // height - invalidate the same way a scale change does. A changed preferred size
@@ -1705,6 +1731,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         // Bookkeeping only: the blit is one instanced draw below, and the shader clamps each tile
         // to the clip rect. Coverage still asks tileVisible - a missing tile nobody sees is fine.
         var covered = true
+        // A visible plain tile still owed its filtered re-cut - see [progressive].
+        var owed = false
         forEachTile(wanted) { txi, tyi ->
             val tkey = key(txi, tyi)
             val tile = st.tiles[tkey]
@@ -1715,6 +1743,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                 // this draw reports as covered.
                 if (tile.plain && st.stable && tileVisible(gp, dst, txi, tyi) && filtersApply(st)) {
                     st.pending.add(tkey)
+                    owed = true
                 }
             } else {
                 if (st.stable) st.pending.add(tkey)
@@ -1722,7 +1751,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             }
         }
 
-        drawInstanced(pass, dst.format, st, useStencilMask)
+        if (covered && !owed) st.revealed = true
+        // Held back: not covered, so the caller draws the whole page the fast way instead.
+        val shown = progressive || st.revealed
+        if (shown) drawInstanced(pass, dst.format, st, useStencilMask)
 
         // Drop what fell outside the wanted range, else a page scrolling past keeps accumulating
         // tiles. Only when the range moved - a scroll crosses a tile boundary every tile-size
@@ -1743,7 +1775,7 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         }
 
         if (st.pending.isNotEmpty()) schedule()
-        return covered
+        return covered && shown
     }
 
     /**
@@ -1997,6 +2029,10 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                     var spentNs = 0.0
                     var generated = 0
                     var visible = false
+                    // Held back, a frame per batch only presents the same fast render again -
+                    // still a refresh on e-ink. Grids that got a visible tile, checked once the
+                    // batch ends for having nothing visible left to make.
+                    val landed = if (progressive) null else HashSet<PageTiles>()
                     val measurements = ArrayList<Job>(MAX_TILES_PER_BATCH)
                     while (generated < MAX_TILES_PER_BATCH && spentNs < BATCH_TARGET_NS) {
                         val req = nextRequest() ?: break
@@ -2014,9 +2050,14 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                             generated++
                             // A turn blits prewarmed tiles, so its pages count. Only if it landed:
                             // a full atlas drops it, and a frame would requeue it.
-                            if ((req.onScreen || req.state.page.isOnScreen) &&
-                                req.state.tiles.containsKey(key(req.tx, req.ty))
-                            ) visible = true
+                            val stored = req.state.tiles.containsKey(key(req.tx, req.ty))
+                            if (landed == null) {
+                                if ((req.onScreen || req.state.page.isOnScreen) && stored) {
+                                    visible = true
+                                }
+                            } else if (req.onScreen && stored) {
+                                landed.add(req.state)
+                            }
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
@@ -2036,6 +2077,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                         (probe ?: break).join()
                         continue
                     }
+                    // The frame then finds the grid whole and shows it, or queues what is still
+                    // missing - a tile the atlas dropped, say - and the worker carries on.
+                    if (landed != null) visible = landed.any { !visiblePending(it) }
                     if (visible) invalidate()
                     if (timestampsSupported) measurements.joinAll() else delay(5.milliseconds)
                 }
@@ -2043,6 +2087,13 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                 workerActive = false
             }
         }
+    }
+
+    /** Whether [st] still has a tile queued inside its visible range as of its last draw. */
+    private fun visiblePending(st: PageTiles): Boolean = st.pending.any {
+        val tx = (it shr 32).toInt()
+        val ty = it.toInt()
+        tx in st.txMin..st.txMax && ty in st.tyMin..st.tyMax
     }
 
     /**
