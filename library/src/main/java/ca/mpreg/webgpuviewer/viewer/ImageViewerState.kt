@@ -88,6 +88,17 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         }
 
     /**
+     * True (the default) sharpens a page tile by tile as the high-quality tiles land. False shows
+     * the fast render until every visible tile is ready, then all of them in one frame - for
+     * e-ink, where every presented frame is a visible refresh. Safe from any thread.
+     */
+    var progressiveTiles: Boolean
+        get() = tiles.progressive
+        set(value) {
+            tiles.progressive = value
+        }
+
+    /**
      * Post-processing over the finished frame - assign [FullscreenFilterChain.filters] to run some.
      * Wired to [invalidate] here, so changing a filter's settings redraws by itself.
      */
