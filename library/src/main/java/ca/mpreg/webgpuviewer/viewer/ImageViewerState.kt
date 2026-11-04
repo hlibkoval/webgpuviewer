@@ -99,6 +99,23 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         }
 
     /**
+     * True keeps the last frame on screen on a page turn until the new page's visible tiles are
+     * all cut, so its first frame is its final one. For paged reading at home zoom, with
+     * [progressiveTiles] false; anything else falls back to that alone. Safe from any thread.
+     */
+    @Volatile
+    var singleRender: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            invalidate()
+        }
+
+    /** The page [singleRender] last let through, on the GPU dispatcher. Not held for again. */
+    private var settledPage: ImagePage? = null
+    private var holdStartNs = 0L
+
+    /**
      * Post-processing over the finished frame - assign [FullscreenFilterChain.filters] to run some.
      * Wired to [invalidate] here, so changing a filter's settings redraws by itself.
      */
@@ -383,7 +400,7 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                 when (renderer.render { encoder, texture ->
                     renderSnapshot(encoder, texture, snapshot)
                 }) {
-                    FrameResult.Drawn -> {
+                    FrameResult.Drawn, FrameResult.Held -> {
                         reportedUnavailable = false
                         retries = 0
                     }
@@ -429,6 +446,9 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
 
     private companion object {
         const val MAX_RETRIES = 10
+
+        /** A page that can't finish its tiles shows anyway, the fast way, after this long. */
+        const val MAX_HOLD_NS = 2_000_000_000L
     }
 
     private class RenderSnapshot(
@@ -498,10 +518,23 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
         tiles.newFrame()
         val page = s.currentPage
 
+        // A turn passes through here on its way to the new page, which a transition draws the fast
+        // way: in single render, the old page stays up until the new one is whole instead.
+        if (singleRender && s.adjacentPage != null && s.offset != 0f) {
+            renderer.holdFrame = true
+            invalidate()
+            return
+        }
+
         if (s.adjacentPage != null && s.offset != 0f) {
             s.transition.render(
                 page, s.adjacentPage, encoder, texture, s.offset, s.firstPos, s.currentPos, tiles
             )
+            return
+        }
+
+        if (holdForTiles(page, texture)) {
+            renderer.holdFrame = true
             return
         }
 
@@ -515,6 +548,22 @@ open class ImageViewerState(var isVertical: Boolean = false, var isReversed: Boo
                 tiles.prewarm(next, texture)
             }
         }
+    }
+
+    /** See [singleRender]. True asks for this frame to be dropped, and for another after it. */
+    private fun holdForTiles(page: ImagePage, texture: GPUTexture): Boolean {
+        if (!singleRender || page === settledPage) return false
+        if (page !is ImagePage.ImageSingle || !page.highQuality || !page.atHome) return false
+        val now = System.nanoTime()
+        if (holdStartNs == 0L) holdStartNs = now
+        val ready = tiles.prepare(page, texture)
+        if (ready || now - holdStartNs > MAX_HOLD_NS) {
+            settledPage = page
+            holdStartNs = 0L
+            return false
+        }
+        invalidate()
+        return true
     }
 
     private val _postInit = mutableListOf<(suspend () -> Unit)>()

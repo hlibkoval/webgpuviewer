@@ -41,6 +41,9 @@ import java.util.concurrent.Executors
 
 enum class FrameResult {
     Drawn,
+
+    /** Nothing presented: what's on screen stays, see [WebGpuRenderer.holdFrame]. */
+    Held,
     Retry,
     Unavailable,
 }
@@ -395,6 +398,9 @@ class WebGpuRenderer {
         onRenderThread(initSurface)
     }
 
+    /** Set during [render]'s block: drop this frame unpresented, leaving the last one on screen. */
+    var holdFrame = false
+
     suspend fun render(fn: suspend (GPUCommandEncoder, GPUTexture) -> Unit): FrameResult {
         if (!isAvailable) return FrameResult.Unavailable
         val startTime = if (profilingEnabled) System.nanoTime() else 0L
@@ -463,6 +469,10 @@ class WebGpuRenderer {
                 // Draws into an offscreen texture when filters are enabled; endFrame runs them
                 // over it and lands the result on the swapchain.
                 fn(encoder, filters.beginFrame(texture))
+                if (holdFrame) {
+                    holdFrame = false
+                    return FrameResult.Held
+                }
                 filters.endFrame(encoder, texture)
                 device.queue.submitAndRelease(encoder)
                 encoder = null

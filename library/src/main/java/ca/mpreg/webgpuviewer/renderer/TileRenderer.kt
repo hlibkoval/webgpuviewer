@@ -1409,9 +1409,9 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
      * Doesn't run [draw]'s retain-window trim either; that catches this grid once the page it
      * displaced becomes current and calls [draw] again.
      */
-    fun prewarm(page: ImagePage.ImageSingle, dst: GPUTexture) {
-        if (page.destroyed || !page.highQuality) return
-        if (!page.hasUploadedImage) return
+    fun prewarm(page: ImagePage.ImageSingle, dst: GPUTexture): Boolean {
+        if (page.destroyed || !page.highQuality) return true
+        if (!page.hasUploadedImage) return true
 
         viewportWidth = dst.width
         viewportHeight = dst.height
@@ -1432,8 +1432,8 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
         st.stable = true
 
         val gp = gridPlacement(page, dst, a.anchorX, a.anchorY, 0f, a.pageScale, st.tileSize)
-            ?: return
-        if (gp.wantL >= gp.wantR || gp.wantT >= gp.wantB) return
+            ?: return true
+        if (gp.wantL >= gp.wantR || gp.wantT >= gp.wantB) return true
 
         val wanted = wantedTileRange(gp)
         val tx0 = wanted.tx0
@@ -1462,11 +1462,11 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
                 if (tile != null) tile.lastUsed = frame else missing++
             }
         }
-        if (missing == 0) return
+        if (missing == 0) return true
 
         var total = 0L
         for (other in pages.values) total += other.tiles.size * tileBytes(other)
-        if (total + missing * tileBytes(st) > maxTileBytes) return
+        if (total + missing * tileBytes(st) > maxTileBytes) return false
 
         var added = false
         for (tyi in ty0..ty1) {
@@ -1482,6 +1482,23 @@ internal class TileRenderer(private val invalidate: () -> Unit) {
             if (!alreadyPrewarming) Log.d(TAG, "Pre-warming next page tiles ${pageId(page)}")
             schedule()
         }
+        return false
+    }
+
+    /**
+     * [prewarm] for a page about to be shown whole: true once all its tiles are cut. A grid the
+     * budget turned away makes room from the least recently drawn page, nothing else being
+     * worth more than the page the reader just asked for.
+     */
+    fun prepare(page: ImagePage.ImageSingle, dst: GPUTexture): Boolean {
+        if (prewarm(page, dst)) return true
+        if (pages[page]?.pending?.isEmpty() != false) {
+            pages.entries.firstOrNull { it.key !== page }?.let { (other, st) ->
+                dropPage(st)
+                pages.remove(other)
+            }
+        }
+        return false
     }
 
     /**
